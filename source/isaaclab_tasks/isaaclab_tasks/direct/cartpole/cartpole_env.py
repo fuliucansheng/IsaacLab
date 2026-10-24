@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Sequence
 
 import torch
@@ -61,6 +62,8 @@ class CartpoleEnv(DirectRLEnv):
     cfg: CartpoleEnvCfg
 
     def __init__(self, cfg: CartpoleEnvCfg, render_mode: str | None = None, **kwargs):
+        self._reward_function = compute_rewards
+        self.reward_fallback_error: str | None = None
         super().__init__(cfg, render_mode, **kwargs)
 
         self._cart_dof_idx, _ = self.cartpole.find_joints(self.cfg.cart_dof_name)
@@ -105,7 +108,7 @@ class CartpoleEnv(DirectRLEnv):
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        total_reward = compute_rewards(
+        reward_args = (
             self.cfg.rew_scale_alive,
             self.cfg.rew_scale_terminated,
             self.cfg.rew_scale_pole_pos,
@@ -117,7 +120,25 @@ class CartpoleEnv(DirectRLEnv):
             self.joint_vel[:, self._cart_dof_idx[0]],
             self.reset_terminated,
         )
-        return total_reward
+        try:
+            return self._reward_function(*reward_args)
+        except RuntimeError as error:
+            # NVRTC rejects the device architecture before launching this pure
+            # reward kernel. Retry only that specific compiler failure using the
+            # same tensor equations; unrelated runtime errors must propagate.
+            if self._reward_function is not compute_rewards or (
+                "nvrtc: error: invalid value for --gpu-architecture (-arch)" not in str(error)
+            ):
+                raise
+            self.reward_fallback_error = str(error)
+            self._reward_function = _compute_rewards_eager
+            warnings.warn(
+                "NVRTC does not support this GPU architecture. Cartpole rewards "
+                "will use eager CUDA tensor operations for this environment.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return self._reward_function(*reward_args)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self.joint_pos = self.cartpole.data.joint_pos
@@ -153,7 +174,6 @@ class CartpoleEnv(DirectRLEnv):
         self.cartpole.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
 
-@torch.jit.script
 def compute_rewards(
     rew_scale_alive: float,
     rew_scale_terminated: float,
@@ -173,3 +193,9 @@ def compute_rewards(
     rew_pole_vel = rew_scale_pole_vel * torch.sum(torch.abs(pole_vel).unsqueeze(dim=1), dim=-1)
     total_reward = rew_alive + rew_termination + rew_pole_pos + rew_cart_vel + rew_pole_vel
     return total_reward
+
+
+# Keep the public TorchScript entry point and a pure tensor fallback with the
+# exact same equations. No global JIT/fuser settings are changed.
+_compute_rewards_eager = compute_rewards
+compute_rewards = torch.jit.script(compute_rewards)
